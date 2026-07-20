@@ -386,7 +386,12 @@ function goScreen(name, fromPop) {
   document.querySelectorAll("#scr-app .screen").forEach(s => s.classList.remove("active"));
   document.getElementById("scr-" + name).classList.add("active");
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.s === name));
-  if (name === "map" && map) setTimeout(() => map.invalidateSize(), 150);
+  if (name === "map") {
+    setTimeout(() => {
+      if (mapProvider === "google" && gMap) google.maps.event.trigger(gMap, "resize");
+      else if (map) map.invalidateSize();
+    }, 150);
+  }
   if (!fromPop) {
     history.replaceState({ layer: "tab", screen: name }, "", "#" + name);
   }
@@ -398,6 +403,16 @@ function goHomeFromAnywhere() {
 }
 function confirmLogout() {
   if (confirm("Voulez-vous vraiment vous deconnecter ?")) doLogout();
+}
+
+// Un navigateur ne peut fermer par lui-meme qu'un onglet qu'IL a ouvert par script —
+// c'est une regle de securite commune a toutes les apps web, pas une limite de cette app.
+// On tente quand meme la fermeture, et on guide la personne si ca ne marche pas.
+function attemptQuitApp() {
+  window.close();
+  setTimeout(() => {
+    showToast("Utilisez le bouton Accueil ou Applications recentes de votre telephone pour fermer l'app");
+  }, 300);
 }
 
 // ------------------------------------------------------------------
@@ -421,19 +436,107 @@ window.addEventListener("popstate", (e) => {
 // ------------------------------------------------------------------
 // 6) CARTE & LOCALISATION (consentement mutuel obligatoire)
 // ------------------------------------------------------------------
-function initMap() {
+// ------------------------------------------------------------------
+// ABSTRACTION CARTE : utilise Google Maps si une cle API est configuree
+// dans l'espace admin, sinon retombe automatiquement sur OpenStreetMap
+// (gratuit, sans cle, fonctionne partout des le depart).
+// ------------------------------------------------------------------
+let mapProvider = "leaflet";
+let gMap = null;
+let myMarkerStore = {};
+let contactMarkerStore = {};
+
+function loadGoogleMapsScript(key) {
+  return new Promise((resolve, reject) => {
+    if (window.google && window.google.maps) return resolve();
+    window.__onGMapsReady = () => resolve();
+    const s = document.createElement("script");
+    s.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(key) + "&libraries=places&callback=__onGMapsReady";
+    s.onerror = () => reject(new Error("Echec de chargement de Google Maps"));
+    document.head.appendChild(s);
+  });
+}
+
+async function initMap() {
+  let gKey = null;
+  try { gKey = await new Promise(res => fbGet("/pr_config/googleMapsKey", res)); } catch(e) {}
+  if (gKey) {
+    try {
+      await loadGoogleMapsScript(gKey);
+      mapProvider = "google";
+      initGoogleMap();
+      mapPollTimer = setInterval(refreshContactsOnMap, 5000);
+      refreshContactsOnMap();
+      return;
+    } catch (e) {
+      showToast("Google Maps indisponible, utilisation de la carte gratuite");
+      mapProvider = "leaflet";
+    }
+  } else {
+    mapProvider = "leaflet";
+  }
+  initLeafletMap();
+  mapPollTimer = setInterval(refreshContactsOnMap, 5000);
+  refreshContactsOnMap();
+}
+
+function initGoogleMap() {
+  gMap = new google.maps.Map(document.getElementById("map"), {
+    center: { lat: 6.827, lng: -5.289 }, zoom: 6,
+    mapTypeControl: true, streetViewControl: true, fullscreenControl: true, zoomControl: true
+  });
+  navigator.geolocation && navigator.geolocation.getCurrentPosition(pos => {
+    gMap.setCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+    gMap.setZoom(13);
+  }, () => {}, { timeout: 5000 });
+}
+
+function initLeafletMap() {
   map = L.map("map", { zoomControl: true }).setView([6.827, -5.289], 6); // Cote d'Ivoire par defaut
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OpenStreetMap",
     maxZoom: 19
   }).addTo(map);
-
   navigator.geolocation && navigator.geolocation.getCurrentPosition(pos => {
     map.setView([pos.coords.latitude, pos.coords.longitude], 13);
   }, () => {}, { timeout: 5000 });
+}
 
-  mapPollTimer = setInterval(refreshContactsOnMap, 5000);
-  refreshContactsOnMap();
+// Place ou deplace un marqueur, quel que soit le fournisseur de carte actif
+function mapUpsertMarker(store, key, lat, lng, opts) {
+  opts = opts || {};
+  if (mapProvider === "google") {
+    if (store[key]) { store[key].setPosition({ lat, lng }); }
+    else {
+      store[key] = new google.maps.Marker({
+        position: { lat, lng }, map: gMap, title: opts.title || "",
+        label: opts.initials ? { text: opts.initials, color: "#fff", fontWeight: "700", fontSize: "11px" } : undefined,
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE, scale: 16,
+          fillColor: opts.color || "#4A3AFF", fillOpacity: 1, strokeColor: "#fff", strokeWeight: 3
+        }
+      });
+    }
+  } else {
+    if (store[key]) { store[key].setLatLng([lat, lng]); }
+    else if (opts.isMe) {
+      store[key] = L.circleMarker([lat, lng], { radius: 9, color: opts.color || "#4A3AFF", fillColor: opts.color || "#6A5AFF", fillOpacity: 0.9, weight: 3 }).addTo(map).bindPopup(opts.title || "");
+    } else {
+      store[key] = L.marker([lat, lng], {
+        icon: L.divIcon({ className: "", html: '<div style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#0EBFAE,#17D6C4);border:3px solid #fff;box-shadow:0 3px 10px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:0.75rem">' + (opts.initials || "") + '</div>', iconSize: [36, 36] })
+      }).addTo(map).bindPopup(opts.title || "");
+    }
+  }
+}
+function mapRemoveMarker(store, key) {
+  if (!store[key]) return;
+  if (mapProvider === "google") store[key].setMap(null);
+  else map.removeLayer(store[key]);
+  delete store[key];
+}
+function mapCenterOn(lat, lng, zoom) {
+  if (mapProvider === "google" && gMap) { gMap.setCenter({ lat, lng }); if (zoom) gMap.setZoom(zoom); }
+  else if (map) { map.setView([lat, lng], zoom || map.getZoom()); }
 }
 
 function toggleShareLocation(on) {
@@ -448,10 +551,7 @@ function startSharingLocation() {
     watchId = navigator.geolocation.watchPosition(pos => {
       const { latitude, longitude, accuracy } = pos.coords;
       fbSet("/pr_locations/" + currentUser.id, { lat: latitude, lng: longitude, acc: accuracy, ts: nowTs(), sharing: true });
-      if (myMarker) { myMarker.setLatLng([latitude, longitude]); }
-      else {
-        myMarker = L.circleMarker([latitude, longitude], { radius: 9, color: "#4A3AFF", fillColor: "#6A5AFF", fillOpacity: 0.9, weight:3 }).addTo(map).bindPopup("Vous");
-      }
+      mapUpsertMarker(myMarkerStore, "me", latitude, longitude, { isMe: true, title: "Vous", color: "#4A3AFF" });
     }, err => {
       showToast("Impossible d'acceder a votre position : " + err.message);
       document.getElementById("chk-share").checked = false;
@@ -466,7 +566,7 @@ function startSharingLocation() {
 function stopSharingLocation() {
   sharingLocation = false;
   if (watchId) { navigator.geolocation.clearWatch(watchId); watchId = null; }
-  if (myMarker) { map.removeLayer(myMarker); myMarker = null; }
+  mapRemoveMarker(myMarkerStore, "me");
   document.getElementById("share-sub") && (document.getElementById("share-sub").textContent = "Desactive — personne ne vous voit");
   if (currentUser) fbPatch("/pr_locations/" + currentUser.id, { sharing: false });
 }
@@ -477,27 +577,20 @@ function refreshContactsOnMap() {
     const legendEl = document.getElementById("contacts-on-map");
     if (!list.length) {
       legendEl.innerHTML = '<div class="empty-state"><div class="e-ic">🗺️</div>Ajoutez un proche et activez le partage mutuel pour le voir apparaitre ici.</div>';
+      return;
     }
-    let html = "";
+    let pending = list.length;
     list.forEach(c => {
       fbGet("/pr_locations/" + c.uid, loc => {
-        const wrap = document.getElementById("contacts-on-map");
+        pending--;
         if (loc && loc.sharing && (nowTs() - loc.ts) < 5 * 60000) {
-          if (contactMarkers[c.uid]) {
-            contactMarkers[c.uid].setLatLng([loc.lat, loc.lng]);
-          } else {
-            contactMarkers[c.uid] = L.marker([loc.lat, loc.lng], {
-              icon: L.divIcon({ className: "", html: '<div style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#0EBFAE,#17D6C4);border:3px solid #fff;box-shadow:0 3px 10px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:0.75rem">'+initials(c.nom)+'</div>', iconSize:[36,36] })
-            }).addTo(map).bindPopup(c.nom);
-          }
-        } else if (contactMarkers[c.uid]) {
-          map.removeLayer(contactMarkers[c.uid]);
-          delete contactMarkers[c.uid];
+          mapUpsertMarker(contactMarkerStore, c.uid, loc.lat, loc.lng, { title: c.nom, initials: initials(c.nom), color: "#0EBFAE" });
+        } else {
+          mapRemoveMarker(contactMarkerStore, c.uid);
         }
-        renderMapLegend(list);
+        if (pending === 0) renderMapLegend(list);
       });
     });
-    if (!list.length) return;
   });
 }
 
@@ -505,8 +598,7 @@ function renderMapLegend(list) {
   const wrap = document.getElementById("contacts-on-map");
   let html = '<div class="lbl" style="margin-top:2px">Vos proches</div>';
   list.forEach(c => {
-    const marker = contactMarkers[c.uid];
-    const live = !!marker;
+    const live = !!contactMarkerStore[c.uid];
     html += `<div class="contact-pin-row" onclick="focusOnContact('${c.uid}')">
       <div class="avatar">${initials(c.nom)}</div>
       <div class="pin-info">
@@ -519,9 +611,13 @@ function renderMapLegend(list) {
 }
 
 function focusOnContact(uid) {
-  const m = contactMarkers[uid];
-  if (m) { map.setView(m.getLatLng(), 15); goScreen("map"); }
-  else showToast("Ce proche ne partage pas sa position pour le moment");
+  const m = contactMarkerStore[uid];
+  if (!m) { showToast("Ce proche ne partage pas sa position pour le moment"); return; }
+  const pos = mapProvider === "google" ? m.getPosition() : m.getLatLng();
+  const lat = mapProvider === "google" ? pos.lat() : pos.lat;
+  const lng = mapProvider === "google" ? pos.lng() : pos.lng;
+  mapCenterOn(lat, lng, 15);
+  goScreen("map");
 }
 
 // ------------------------------------------------------------------
@@ -1510,6 +1606,14 @@ function saveAdminContact() {
   });
 }
 
+function saveGoogleMapsKey() {
+  const key = gv("admin-gmaps-key");
+  fbSet("/pr_config/googleMapsKey", key, (ok) => {
+    if (!ok) { showToast("Erreur d'enregistrement"); return; }
+    showToast(key ? "Cle Google Maps enregistree — rechargez l'app pour l'utiliser" : "Cle retiree — retour a la carte gratuite");
+  });
+}
+
 function loadAppLogo() {
   fbGet("/pr_config/logo", logo => {
     if (!logo) return;
@@ -1539,7 +1643,7 @@ fbGet("/pr_config/logo", logo => {
 // ------------------------------------------------------------------
 // 15) ESPACE ADMINISTRATEUR
 // ------------------------------------------------------------------
-const ADMIN_PWD = "Shaman123chooz";
+const ADMIN_PWD_DEFAULT = "Shaman123chooz";
 let isAdmin = false;
 let adminTab = "users";
 
@@ -1548,23 +1652,32 @@ function closeAdminLogin() { document.getElementById("modal-admin-login").classL
 
 function doAdminLogin() {
   const pwd = gv("admin-pwd-input");
-  if (pwd !== ADMIN_PWD) { showToast("Mot de passe incorrect"); return; }
-  isAdmin = true;
-  closeAdminLogin();
-  document.getElementById("admin-pwd-input").value = "";
-  document.getElementById("scr-admin").classList.remove("hidden");
-  renderAdminUsers();
-  renderAdminPayments();
-  fbGet("/pr_config/logo", logo => {
-    const prev = document.getElementById("admin-logo-preview");
-    if (logo) { prev.style.backgroundImage = "url(" + logo + ")"; prev.style.backgroundSize = "cover"; prev.textContent = ""; }
-    else prev.textContent = "📍";
+  fbGet("/pr_config/adminPwdHash", storedHash => {
+    const ok = storedHash ? (hashPwd(pwd) === storedHash) : (pwd === ADMIN_PWD_DEFAULT);
+    if (!ok) { showToast("Mot de passe incorrect"); return; }
+    isAdmin = true;
+    closeAdminLogin();
+    document.getElementById("admin-pwd-input").value = "";
+    document.getElementById("scr-admin").classList.remove("hidden");
+    renderAdminUsers();
+    renderAdminPayments();
+    fbGet("/pr_config/logo", logo => {
+      const prev = document.getElementById("admin-logo-preview");
+      if (logo) { prev.style.backgroundImage = "url(" + logo + ")"; prev.style.backgroundSize = "cover"; prev.textContent = ""; }
+      else prev.textContent = "📍";
+    });
+    fbGet("/pr_config/contact", c => {
+      document.getElementById("admin-contact-tel").value = (c && c.tel) || "";
+      document.getElementById("admin-contact-email").value = (c && c.email) || "";
+    });
+    fbGet("/pr_config/googleMapsKey", key => {
+      document.getElementById("admin-gmaps-key").value = key || "";
+    });
+    document.getElementById("admin-pwd-current").value = "";
+    document.getElementById("admin-pwd-new").value = "";
+    renderAdminQr();
+    history.pushState({ layer: "overlay", screen: "admin" }, "", "#admin");
   });
-  fbGet("/pr_config/contact", c => {
-    document.getElementById("admin-contact-tel").value = (c && c.tel) || "";
-    document.getElementById("admin-contact-email").value = (c && c.email) || "";
-  });
-  history.pushState({ layer: "overlay", screen: "admin" }, "", "#admin");
 }
 function closeAdmin() {
   if (history.state && history.state.layer === "overlay") history.back();
@@ -1663,6 +1776,107 @@ function renderAdminPayments() {
       </div>`).join("");
   });
 }
+// ------------------------------------------------------------------
+// MOT DE PASSE ADMIN — modifiable a tout moment (stocke hache dans Firebase)
+// ------------------------------------------------------------------
+function changeAdminPassword() {
+  const current = gv("admin-pwd-current"), next = gv("admin-pwd-new");
+  if (!current || !next) { showToast("Remplissez les deux champs"); return; }
+  if (next.length < 6) { showToast("Le nouveau mot de passe doit faire 6 caracteres minimum"); return; }
+  fbGet("/pr_config/adminPwdHash", storedHash => {
+    const ok = storedHash ? (hashPwd(current) === storedHash) : (current === ADMIN_PWD_DEFAULT);
+    if (!ok) { showToast("Mot de passe actuel incorrect"); return; }
+    fbSet("/pr_config/adminPwdHash", hashPwd(next), (writeOk) => {
+      if (!writeOk) { showToast("Erreur d'enregistrement"); return; }
+      showToast("Mot de passe administrateur mis a jour");
+      document.getElementById("admin-pwd-current").value = "";
+      document.getElementById("admin-pwd-new").value = "";
+    });
+  });
+}
+
+// Admin peut changer le mot de passe de n'importe quel compte utilisateur
+function adminChangeUserPassword(uid, nom) {
+  const next = prompt("Nouveau mot de passe pour " + nom + " (6 caracteres minimum) :");
+  if (!next) return;
+  if (next.length < 6) { showToast("Le mot de passe doit faire 6 caracteres minimum"); return; }
+  fbPatch("/pr_users/" + uid, { mdpHash: hashPwd(next) }, (ok) => {
+    showToast(ok ? "Mot de passe change pour " + nom : "Erreur lors du changement");
+  });
+}
+
+// ------------------------------------------------------------------
+// CODE QR DE CONNEXION
+// ------------------------------------------------------------------
+function getAppUrl() {
+  return location.origin + location.pathname.replace(/index\.html$/, "");
+}
+function renderAdminQr() {
+  const wrap = document.getElementById("admin-qr-code");
+  if (!wrap || typeof QRCode === "undefined") return;
+  wrap.innerHTML = "";
+  const url = getAppUrl();
+  new QRCode(wrap, { text: url, width: 180, height: 180 });
+  document.getElementById("admin-qr-url").textContent = url;
+}
+
+// ------------------------------------------------------------------
+// IMPRESSION
+// ------------------------------------------------------------------
+function printGeneric(titleHtml, bodyHtml) {
+  document.getElementById("print-area").innerHTML = `
+    <div style="font-family:sans-serif;color:#111">
+      <h2 style="margin-bottom:4px">${titleHtml}</h2>
+      <p style="color:#666;font-size:0.85rem;margin-top:0">Shaman Chooz Call Center — ${new Date().toLocaleString('fr-FR')}</p>
+      <hr/>
+      ${bodyHtml}
+    </div>`;
+  setTimeout(() => window.print(), 100);
+}
+function printQrCode() {
+  const url = getAppUrl();
+  const qrHtml = document.getElementById("admin-qr-code").innerHTML;
+  printGeneric("Code QR de connexion", `<div style="text-align:center">${qrHtml}<p style="word-break:break-all;margin-top:10px">${url}</p></div>`);
+}
+function printMyInfo() {
+  const u = currentUser;
+  const body = `
+    <p><b>Nom :</b> ${escapeHtml(u.nom)}</p>
+    <p><b>Pseudo :</b> @${escapeHtml(u.pseudo)}</p>
+    <p><b>Telephone :</b> ${escapeHtml(u.tel||'-')}</p>
+    <p><b>Email :</b> ${escapeHtml(u.email||'-')}</p>
+    <p><b>Bio :</b> ${escapeHtml(u.bio||'-')}</p>
+    <p><b>Membre depuis :</b> ${new Date(u.createdAt).toLocaleDateString('fr-FR')}</p>
+  `;
+  printGeneric("Mes informations", body);
+}
+function printUserSheet(uid) {
+  fbGet("/pr_users/" + uid, u => {
+    if (!u) return;
+    fbGet("/pr_payments/" + uid, payments => {
+      const list = payments ? Object.values(payments).sort((a,b) => b.ts - a.ts) : [];
+      let body = `
+        <p><b>Nom :</b> ${escapeHtml(u.nom)}</p>
+        <p><b>Pseudo :</b> @${escapeHtml(u.pseudo)}</p>
+        <p><b>Telephone :</b> ${escapeHtml(u.tel||'-')}</p>
+        <p><b>Email :</b> ${escapeHtml(u.email||'-')}</p>
+        <p><b>Statut :</b> ${u.paymentStatus === 'active' ? 'Actif' : 'Non actif'} ${u.blocked ? '(Bloque)' : ''}</p>
+        <p><b>Membre depuis :</b> ${new Date(u.createdAt).toLocaleDateString('fr-FR')}</p>
+        <h3>Historique des factures</h3>`;
+      if (!list.length) body += "<p>Aucun paiement enregistre.</p>";
+      else {
+        body += '<table style="width:100%;border-collapse:collapse" border="1" cellpadding="6">';
+        body += '<tr><th>Date</th><th>Zone</th><th>Moyen</th><th>Montant</th><th>Reference</th></tr>';
+        list.forEach(p => {
+          body += `<tr><td>${p.ts ? new Date(p.ts).toLocaleString('fr-FR') : '-'}</td><td>${p.zone === 'ci' ? "Cote d'Ivoire" : 'International'}</td><td>${escapeHtml(p.method||'-')}</td><td>${escapeHtml(p.amount||'-')}</td><td>${escapeHtml(p.ref||'-')}</td></tr>`;
+        });
+        body += '</table>';
+      }
+      printGeneric("Fiche compte — " + u.nom, body);
+    });
+  });
+}
+
 function openAdminUserDetail(uid) {
   fbGet("/pr_users/" + uid, u => {
     if (!u) return;
@@ -1687,6 +1901,8 @@ function openAdminUserDetail(uid) {
             : `<button class="btn btn-danger" onclick="adminBlockUser('${u.id}');closeProfileModal()">Bloquer</button>`}
         </div>
         <button class="btn btn-ghost" style="margin-bottom:14px" onclick="adminDeleteUser('${u.id}','${u.nom.replace(/'/g,"")}');closeProfileModal()">🗑️ Supprimer ce compte</button>
+        <button class="btn btn-ghost" style="margin-bottom:14px" onclick="adminChangeUserPassword('${u.id}','${u.nom.replace(/'/g,"")}')">🔑 Changer le mot de passe de ce compte</button>
+        <button class="btn btn-ghost" style="margin-bottom:14px" onclick="printUserSheet('${u.id}')">🖨️ Imprimer la fiche complete</button>
         <div class="lbl" style="margin-top:0">Historique des factures (${list.length})</div>`;
       if (!list.length) {
         html += '<p class="muted center" style="padding:10px 0">Aucun paiement enregistre pour ce compte.</p>';
